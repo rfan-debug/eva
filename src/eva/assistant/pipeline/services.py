@@ -4,6 +4,7 @@ Creates Pipecat services with proper configuration.
 """
 
 import datetime
+import os
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -525,18 +526,48 @@ def create_realtime_llm_service(
             )
 
         gemini_model = params.get("model")
-        logger.info(f"Using Gemini Live LLM: {gemini_model}")
+        backend = params.get("backend", "").lower()
 
-        return GeminiLiveLLMService(
-            api_key=params["api_key"],
-            tools=pipecat_tools,
-            settings=GeminiLiveLLMService.Settings(
+        # Vertex AI backend: use project/location instead of api_key
+        use_vertex = backend == "vertex_ai" or (
+            not params.get("api_key") and (params.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT"))
+        )
+
+        service_kwargs: dict[str, Any] = {
+            "tools": pipecat_tools,
+            "settings": GeminiLiveLLMService.Settings(
                 model=gemini_model,
                 system_instruction=system_prompt,
                 voice=params.get("voice", "Puck"),  # Aoede, Charon, Fenrir, Kore, Puck
                 vad=GeminiVADParams(disabled=params.get("vad_disabled", True)),
             ),
-        )
+        }
+
+        if use_vertex:
+            project = params.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+            location = params.get("location") or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            if not project:
+                raise ValueError(
+                    "Gemini Live via Vertex AI requires a GCP project. "
+                    "Set 'project' in EVA_MODEL__S2S_PARAMS or GOOGLE_CLOUD_PROJECT env var."
+                )
+            logger.info(f"Using Gemini Live LLM via Vertex AI: {gemini_model} (project={project}, location={location})")
+            # GeminiLiveLLMService accepts google-genai Client kwargs;
+            # pass vertexai=True to route through Vertex AI endpoints.
+            service_kwargs["vertexai"] = True
+            service_kwargs["project"] = project
+            service_kwargs["location"] = location
+        else:
+            api_key = params.get("api_key", "")
+            if not api_key:
+                raise ValueError(
+                    "Gemini Live via Google AI requires an API key. "
+                    "Set 'api_key' in EVA_MODEL__S2S_PARAMS or use backend=vertex_ai."
+                )
+            logger.info(f"Using Gemini Live LLM via Google AI: {gemini_model}")
+            service_kwargs["api_key"] = api_key
+
+        return GeminiLiveLLMService(**service_kwargs)
 
     else:
         raise ValueError(f"Unknown realtime model: {model}. Available: gpt-realtime, ultravox, gemini-live")

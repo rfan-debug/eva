@@ -1,7 +1,10 @@
 """Gemini Live AssistantServer for EVA-Bench.
 
 Bridges between Twilio-framed WebSocket (user simulator) and Google's Gemini Live
-API via the google-genai Python SDK.  Audio flows:
+API via the google-genai Python SDK.  Supports both Google AI (API key) and
+Vertex AI (service account / ADC) backends.
+
+Audio flows:
 
     User simulator (8 kHz mulaw)
         -> 16 kHz PCM16 -> Gemini Live input
@@ -10,6 +13,21 @@ API via the google-genai Python SDK.  Audio flows:
 
 All tool calls are executed locally via ToolExecutor; transcription events
 from Gemini populate the audit log.
+
+Backend selection (via s2s_params):
+
+    Google AI (default):
+        {"model": "gemini-2.5-flash", "api_key": "...", "voice": "Kore"}
+
+    Vertex AI:
+        {"model": "gemini-2.5-flash", "backend": "vertex_ai",
+         "project": "my-gcp-project", "location": "us-central1",
+         "voice": "Kore"}
+
+    When backend=vertex_ai, authentication uses Application Default Credentials
+    (ADC) or the path specified in GOOGLE_APPLICATION_CREDENTIALS.  The project
+    and location can also be set via GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION
+    environment variables as fallbacks.
 """
 
 from __future__ import annotations
@@ -188,6 +206,12 @@ class GeminiLiveAssistantServer(AbstractAssistantServer):
         self._language_code = s2s_params.get("language_code", "en-US")
         self._api_key = s2s_params.get("api_key", "")
 
+        # Vertex AI configuration
+        # backend: "vertex_ai" | "google_ai" (default: auto-detect from api_key presence)
+        self._backend = s2s_params.get("backend", "").lower()
+        self._vertex_project = s2s_params.get("project", "") or os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+        self._vertex_location = s2s_params.get("location", "") or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
         # Build system prompt (same pattern as pipecat realtime)
         prompt_manager = PromptManager()
         self._system_prompt = prompt_manager.get_prompt(
@@ -271,20 +295,55 @@ class GeminiLiveAssistantServer(AbstractAssistantServer):
     # ------------------------------------------------------------------
 
     def _create_genai_client(self) -> genai.Client:
-        """Create a google-genai Client using Vertex AI or API key."""
+        """Create a google-genai Client for Google AI or Vertex AI.
+
+        Backend resolution order:
+        1. Explicit ``backend`` in s2s_params ("vertex_ai" or "google_ai")
+        2. If ``api_key`` is set -> Google AI
+        3. If ``project`` is set (param or env) -> Vertex AI
+        4. Fallback to SDK default credential resolution
+        """
+        use_vertex = self._resolve_backend()
+
+        if use_vertex:
+            if not self._vertex_project:
+                raise ValueError(
+                    "Vertex AI backend requires a GCP project. Set 'project' in "
+                    "EVA_MODEL__S2S_PARAMS or GOOGLE_CLOUD_PROJECT env var."
+                )
+            logger.info(
+                f"Using Vertex AI backend (project={self._vertex_project}, "
+                f"location={self._vertex_location}, model={self._model})"
+            )
+            return genai.Client(
+                vertexai=True,
+                project=self._vertex_project,
+                location=self._vertex_location,
+            )
+
         if self._api_key:
-            logger.info("Using Gemini API key for authentication")
+            logger.info(f"Using Google AI backend with API key (model={self._model})")
             return genai.Client(api_key=self._api_key)
 
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-        if project:
-            logger.info(f"Using Vertex AI (project={project}, location={location})")
-            return genai.Client(vertexai=True, project=project, location=location)
-
         # Fallback: let the SDK resolve credentials (e.g. ADC)
-        logger.warning(msg="No explicit credentials; relying on google-genai default resolution")
+        logger.warning("No explicit credentials; relying on google-genai default resolution")
         return genai.Client()
+
+    def _resolve_backend(self) -> bool:
+        """Determine whether to use Vertex AI.
+
+        Returns True for Vertex AI, False for Google AI (API key).
+        """
+        if self._backend == "vertex_ai":
+            return True
+        if self._backend in ("google_ai", "api_key"):
+            return False
+        # Auto-detect: prefer API key if set, otherwise try Vertex AI
+        if self._api_key:
+            return False
+        if self._vertex_project:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Live session configuration
