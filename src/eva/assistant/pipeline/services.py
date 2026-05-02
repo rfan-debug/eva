@@ -529,9 +529,7 @@ def create_realtime_llm_service(
         backend = params.get("backend", "").lower()
 
         # Vertex AI backend: use project/location instead of api_key
-        use_vertex = backend == "vertex_ai" or (
-            not params.get("api_key") and (params.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT"))
-        )
+        use_vertex = backend == "vertex_ai"
 
         service_kwargs: dict[str, Any] = {
             "tools": pipecat_tools,
