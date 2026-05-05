@@ -134,7 +134,7 @@ def _agent_tools_to_gemini(agent: AgentConfig) -> list[types.Tool] | None:
                 name=tool.function_name,
                 description=f"{tool.name}: {tool.description}",
                 parameters=params_schema,
-                behavior=types.Behavior.BLOCKING,
+                # behavior=types.Behavior.BLOCKING,
             )
         )
 
@@ -184,6 +184,7 @@ class GeminiLiveAssistantServer(AbstractAssistantServer):
             logger.error("Pipeline config is not SpeechToSpeechConfig")
             return
         self._model = s2s_params["model"]
+        self._endpoint = s2s_params["endpoint"]
         self._voice = s2s_params.get("voice", "Kore")
         self._language_code = s2s_params.get("language_code", "en-US")
         self._api_key = s2s_params.get("api_key", "")
@@ -280,7 +281,14 @@ class GeminiLiveAssistantServer(AbstractAssistantServer):
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
         if project:
             logger.info(f"Using Vertex AI (project={project}, location={location})")
-            return genai.Client(vertexai=True, project=project, location=location)
+            return genai.Client(
+                vertexai=True, 
+                project=project, 
+                location=location,
+                http_options=types.HttpOptions(
+                    base_url=f"wss://{self._endpoint}"
+                ),
+            )
 
         # Fallback: let the SDK resolve credentials (e.g. ADC)
         logger.warning(msg="No explicit credentials; relying on google-genai default resolution")
