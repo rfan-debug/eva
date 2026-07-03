@@ -9,10 +9,12 @@ Uses JSON + base64 μ-law encoding (Twilio-style protocol).
 
 import asyncio
 import base64
+import functools
 import json
 import time
 from collections.abc import Callable
 
+import numpy as np
 import websockets
 from websockets.protocol import State as WebSocketState
 
@@ -43,6 +45,18 @@ SEND_CHUNK_SIZE_PCM = int(ELEVENLABS_OUTPUT_RATE * SEND_CHUNK_DURATION_MS / 1000
 SILENCE_DETECTION_THRESHOLD_S = 0.2  # 200ms to detect assistant audio end
 USER_END_DETECTION_DELAY_INTERVALS = 30  # 600ms (30 x 20ms) - longer to avoid splitting natural pauses
 USER_CATCHUP_SILENCE_CHUNKS = 0  # Don't send catch-up silence for user - let VAD detect naturally
+USER_TRAILING_SILENCE_CHUNKS = (
+    100  # 2s (100 x 20ms) appended after each user turn so the assistant VAD reliably detects end-of-speech
+)
+# The trailing block appended after each user turn is white noise (not pure
+# silence) so the assistant sees a realistic noise floor rather than digital
+# silence. The level is an ABSOLUTE full-scale SNR: RMS = 32768 * 10^(-SNR/20).
+# Higher dB = quieter noise. At 45 dB the RMS is ~184 (16-bit), i.e. -45 dBFS,
+# which stays well below assistant VAD speech thresholds so it reads as silence
+# for end-of-speech detection. Lowering this (louder noise) can suppress
+# end-of-speech detection and break turn-taking.
+USER_TRAILING_NOISE_SNR_DB = 45.0
+_FULL_SCALE_RMS = 32768.0  # absolute reference for full-scale 16-bit PCM
 ASSISTANT_CATCHUP_SILENCE_CHUNKS = 10  # 200ms catch-up silence when assistant stops
 FAST_POLL_TIMEOUT_S = 0.005  # 5ms - fast polling during active audio
 NORMAL_POLL_TIMEOUT_S = 0.01  # 10ms - normal polling
@@ -53,6 +67,35 @@ LOG_INTERVAL_SILENCE = 50  # Log every 50 silence chunks (~1s at 20ms)
 LOG_INTERVAL_AUDIO_SEND = 200  # Log every 200 sent chunks
 LOG_INTERVAL_AUDIO_RECV = 100  # Log every 100 received chunks
 LOG_INTERVAL_INPUT_STREAM = 4  # Log every 4 input chunks (~1s at 250ms)
+
+
+@functools.cache
+def _silence_pcm(chunk_size: int = SEND_CHUNK_SIZE_PCM) -> bytes:
+    """Return a cached PCM silence chunk of the given size.
+
+    Silence is constant, so the buffer is built once per size and reused
+    instead of re-allocating it for every frame in a streaming loop.
+    """
+    return b"\x00" * chunk_size
+
+
+@functools.cache
+def _white_noise_pcm(
+    chunk_size: int = SEND_CHUNK_SIZE_PCM,
+    snr_db: float = USER_TRAILING_NOISE_SNR_DB,
+) -> bytes:
+    """Return a cached white-noise PCM chunk (16kHz 16-bit mono).
+
+    The noise RMS is set to an ABSOLUTE full-scale SNR: ``snr_db`` below full
+    scale, i.e. ``RMS = 32768 * 10^(-snr_db/20)`` (so 20 dB -> -20 dBFS). A
+    single deterministic buffer is generated once per (size, snr) and reused for
+    every frame, so no allocation or RNG work happens inside the streaming loop.
+    """
+    n_samples = chunk_size // PCM_SAMPLE_WIDTH
+    target_rms = _FULL_SCALE_RMS * (10 ** (-snr_db / 20.0))
+    rng = np.random.default_rng(0)  # fixed seed -> deterministic, cached buffer
+    samples = rng.normal(0.0, target_rms, size=n_samples)
+    return np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
 
 
 class BotToBotAudioInterface(AudioInterface):
@@ -110,6 +153,11 @@ class BotToBotAudioInterface(AudioInterface):
         self._assistant_audio_active = False  # framework_agent speaking
         self._user_audio_ended_time = None  # Track when user audio ended for silence sending
         self._assistant_audio_ended_time = None  # Track when assistant audio ended for silence sending
+
+        # Number of trailing white-noise frames still to stream after a user turn.
+        # Set (non-blocking) by _on_user_audio_end and drained one frame per
+        # real-time tick by _send_to_assistant, so the send loop never blocks.
+        self._pending_trailing_noise_chunks = 0
 
         # Shutdown state
         self._stopping = False
@@ -360,15 +408,48 @@ class BotToBotAudioInterface(AudioInterface):
         if self._perturbator is not None and self._perturbator.has_ambient_noise:
             silence_pcm = self._perturbator.get_ambient_chunk(chunk_size)
         else:
-            silence_pcm = b"\x00" * chunk_size
+            silence_pcm = _silence_pcm(chunk_size)
         silence_mulaw = self._convert_pcm_to_mulaw(silence_pcm)
 
         if not silence_mulaw:
             return False
         return await self._send_audio_frame(silence_mulaw)
 
-    async def _send_catchup_silence(self, source: str, num_chunks: int) -> None:
-        """Send catch-up silence frames to cover detection delay.
+    async def _send_white_noise_frame(self, chunk_size: int = SEND_CHUNK_SIZE_PCM) -> bool:
+        """Send one frame of low-level white noise to the websocket.
+
+        Uses a cached noise buffer (see ``_white_noise_pcm``) so no allocation
+        or RNG work happens per frame.
+
+        Args:
+            chunk_size: Size of chunk in bytes (at 16kHz PCM)
+
+        Returns:
+            True if the frame was sent, False otherwise.
+        """
+        noise_mulaw = self._convert_pcm_to_mulaw(_white_noise_pcm(chunk_size))
+        if not noise_mulaw:
+            return False
+        return await self._send_audio_frame(noise_mulaw)
+
+    async def _send_trailing_noise_frame(self) -> bool:
+        """Send one frame of the scheduled trailing white-noise block.
+
+        Decrements ``_pending_trailing_noise_chunks`` and records the frame into
+        the user track on success. Returns True if a frame was sent.
+        """
+        if not await self._send_white_noise_frame():
+            return False
+        self._pending_trailing_noise_chunks -= 1
+        # Record so the saved user audio matches what was streamed to the wire.
+        if self.record_callback:
+            noise_pcm = _white_noise_pcm(SEND_CHUNK_SIZE_PCM)
+            self.record_callback("user", noise_pcm)
+            self.record_callback("user_clean", noise_pcm)
+        return True
+
+    async def _send_catchup_silence(self, source: str, num_chunks: int, *, use_white_noise: bool = False) -> None:
+        """Send catch-up silence (or white-noise) frames to cover detection delay.
 
         Sends chunks at real-time rate (20ms intervals) to maintain proper
         audio timing for STT/VAD systems.
@@ -376,10 +457,25 @@ class BotToBotAudioInterface(AudioInterface):
         Args:
             source: "assistant" or "user" - who the silence represents
             num_chunks: Number of 20ms chunks to send
+            use_white_noise: When True, send low-level white noise instead of
+                pure silence so the assistant's VAD sees a realistic noise floor.
         """
         send_interval = SEND_CHUNK_DURATION_MS / 1000.0  # 20ms
+        record_user = self.record_callback is not None and source == "user"
+        # Precompute the (cached) frame once; both silence and white noise are
+        # fixed buffers, so no per-frame allocation happens in the loop below.
+        record_pcm = _white_noise_pcm(SEND_CHUNK_SIZE_PCM) if use_white_noise else _silence_pcm(SEND_CHUNK_SIZE_PCM)
         for i in range(num_chunks):
-            await self._send_silence_frame(chunk_size=SEND_CHUNK_SIZE_PCM)
+            sent = (
+                await self._send_white_noise_frame()
+                if use_white_noise
+                else await self._send_silence_frame(chunk_size=SEND_CHUNK_SIZE_PCM)
+            )
+            if sent and record_user:
+                # Record what was streamed so the saved audio matches the wire
+                # (e.g. the white-noise block appended after a user turn).
+                self.record_callback("user", record_pcm)
+                self.record_callback("user_clean", record_pcm)
             # Space out chunks at real-time rate (skip delay on last chunk)
             if i < num_chunks - 1:
                 await asyncio.sleep(send_interval)
@@ -388,6 +484,9 @@ class BotToBotAudioInterface(AudioInterface):
         """Handle user audio starting."""
         self._user_audio_active = True
         self._user_audio_ended_time = None
+        # A new user turn supersedes any trailing noise still queued from the
+        # previous turn, so cancel the remainder.
+        self._pending_trailing_noise_chunks = 0
         timestamp_ms = time.time()
 
         if self._assistant_audio_ended_time is not None:
@@ -440,6 +539,18 @@ class BotToBotAudioInterface(AudioInterface):
         # blocking and lets the VAD detect end-of-speech from actual silence.
         if USER_CATCHUP_SILENCE_CHUNKS > 0:
             await self._send_catchup_silence("assistant", USER_CATCHUP_SILENCE_CHUNKS)
+
+        # Schedule a fixed block of trailing white noise after each user turn.
+        # Some assistant models fail to emit an end-of-speech signal from the
+        # natural inter-turn gap alone, so we stream an explicit ~2s of white
+        # noise to give their VAD an unambiguous end-of-speech boundary with a
+        # realistic noise floor.
+        #
+        # This is scheduled NON-BLOCKING: we only set a counter here and let the
+        # _send_to_assistant loop drain it one frame per real-time (20ms) tick.
+        # Awaiting the whole block inline would block that loop for ~2s, backing
+        # up the send queue and desynchronizing the next turn's cadence.
+        self._pending_trailing_noise_chunks = USER_TRAILING_SILENCE_CHUNKS
 
     def _on_assistant_audio_start(self) -> None:
         """Handle assistant audio starting."""
@@ -619,6 +730,10 @@ class BotToBotAudioInterface(AudioInterface):
         stream_start_time: float | None = None  # Set when first audio chunk arrives
         silence_start_time: float | None = None  # Set when silence sending begins
         silence_chunks_sent = 0  # Separate counter for silence
+        # Last time real user audio arrived from the queue. Used to detect
+        # end-of-turn even when the utterance ends on a full-chunk boundary
+        # (i.e. pending_audio is empty, so the partial-chunk path never fires).
+        last_audio_recv_time: float | None = None
         next_send_time = asyncio.get_event_loop().time()
 
         logger.info(
@@ -644,6 +759,7 @@ class BotToBotAudioInterface(AudioInterface):
                 try:
                     pcm_audio = await asyncio.wait_for(self.send_queue.get(), timeout=timeout)
                     pending_audio += pcm_audio
+                    last_audio_recv_time = asyncio.get_event_loop().time()
                     # Initialize/reset stream start time when audio arrives after idle/silence
                     if stream_start_time is None or not self._user_audio_active:
                         stream_start_time = asyncio.get_event_loop().time()
@@ -705,10 +821,41 @@ class BotToBotAudioInterface(AudioInterface):
                                     stream_start_time = None
                                     next_send_time = current_time + send_interval
 
+                # Fallback end-of-turn detection: if the user is still marked
+                # active but there is NO leftover partial chunk (the utterance
+                # ended on a full-chunk boundary or the queue simply went quiet),
+                # the partial-chunk path above never fires. Detect the silence
+                # directly from the queue-inactivity gap so the turn always ends.
+                if (
+                    self._user_audio_active
+                    and not pending_audio
+                    and last_audio_recv_time is not None
+                    and current_time - last_audio_recv_time >= send_interval * USER_END_DETECTION_DELAY_INTERVALS
+                ):
+                    logger.info("No user audio for end-detection delay - end of utterance")
+                    await self._on_user_audio_end(current_time)
+                    stream_start_time = None
+                    next_send_time = current_time + send_interval
+                    last_audio_recv_time = None
+
+                # Drain the trailing white-noise block scheduled by
+                # _on_user_audio_end, one frame per real-time (20ms) tick. This
+                # keeps the loop responsive (non-blocking): if the user starts a
+                # new turn, real audio takes the branch above and this is reset.
+                if self._pending_trailing_noise_chunks > 0 and not pending_audio and not self._user_audio_active:
+                    # Initialize timing baseline when starting the noise block.
+                    if silence_start_time is None:
+                        silence_start_time = current_time
+                        silence_chunks_sent = 0
+                        next_send_time = silence_start_time
+                    if current_time >= next_send_time and await self._send_trailing_noise_frame():
+                        silence_chunks_sent += 1
+                        next_send_time = silence_start_time + (silence_chunks_sent * send_interval)
+
                 # Send user silence/ambient noise while user is not speaking.
                 # Ambient noise streams continuously (including during assistant speech).
                 # Regular silence only sends when waiting for user to respond after assistant spoke.
-                if self._should_send_ambient_noise() or self._should_send_user_silence():
+                elif self._should_send_ambient_noise() or self._should_send_user_silence():
                     # Initialize silence timing baseline when starting a NEW silence period
                     if silence_start_time is None:
                         silence_start_time = current_time
@@ -719,7 +866,7 @@ class BotToBotAudioInterface(AudioInterface):
                     # Regular silence: only send after assistant has spoken at least once
                     can_send = self._should_send_ambient_noise() or self._assistant_audio_ended_time is not None
                     if current_time >= next_send_time and can_send:
-                        silence_pcm = b"\x00" * pcm_chunk_size
+                        silence_pcm = _silence_pcm(pcm_chunk_size)
                         if await self._send_silence_frame():
                             silence_chunks_sent += 1
                             # Use absolute timing for silence (prevents drift)

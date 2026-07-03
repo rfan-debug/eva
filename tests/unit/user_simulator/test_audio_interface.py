@@ -59,6 +59,50 @@ class TestConvertPcmToMulaw:
         assert isinstance(result, bytes)
 
 
+class TestWhiteNoisePcm:
+    """The trailing block uses white noise at an absolute full-scale SNR."""
+
+    def test_correct_size_and_dtype(self):
+        """640 bytes PCM (20ms @ 16kHz) of int16 noise."""
+        import numpy as np
+
+        from eva.user_simulator.audio_interface import _white_noise_pcm
+
+        noise = _white_noise_pcm(SEND_CHUNK_SIZE_PCM)
+        assert len(noise) == SEND_CHUNK_SIZE_PCM
+        samples = np.frombuffer(noise, dtype=np.int16)
+        assert len(samples) == SEND_CHUNK_SIZE_PCM // 2
+
+    def test_not_silence(self):
+        """White noise must differ from digital silence."""
+        from eva.user_simulator.audio_interface import _white_noise_pcm
+
+        assert _white_noise_pcm() != b"\x00" * len(_white_noise_pcm())
+
+    def test_rms_matches_absolute_full_scale_snr_target(self):
+        """RMS should be USER_TRAILING_NOISE_SNR_DB below full scale (dBFS)."""
+        import numpy as np
+
+        from eva.user_simulator.audio_interface import (
+            _FULL_SCALE_RMS,
+            USER_TRAILING_NOISE_SNR_DB,
+            _white_noise_pcm,
+        )
+
+        # Large buffer for a stable RMS estimate.
+        samples = np.frombuffer(_white_noise_pcm(32000), dtype=np.int16).astype(np.float64)
+        rms = np.sqrt(np.mean(samples**2))
+        expected = _FULL_SCALE_RMS * (10 ** (-USER_TRAILING_NOISE_SNR_DB / 20.0))
+        # Within 5% of the target (RNG variance on a fixed seed).
+        assert abs(rms - expected) / expected < 0.05
+
+    def test_is_cached_and_deterministic(self):
+        """Repeated calls return the identical cached buffer (no per-frame RNG)."""
+        from eva.user_simulator.audio_interface import _white_noise_pcm
+
+        assert _white_noise_pcm() is _white_noise_pcm()
+
+
 class TestSilenceDetectionStateMachine:
     """_should_send_assistant_silence and _should_send_user_silence"""
 
@@ -145,11 +189,163 @@ class TestAudioStateTransitions:
         iface = _make_interface(event_logger=event_logger)
         iface._user_audio_active = True
 
+        # _on_user_audio_end is non-blocking (it only schedules trailing noise),
+        # so no mocking is needed for the call to stay fast.
         await iface._on_user_audio_end(150.0)
 
         assert iface._user_audio_active is False
         assert iface._user_audio_ended_time == 150.0
         event_logger.log_audio_end.assert_called_once_with("elevenlabs_user")
+
+    @pytest.mark.asyncio
+    async def test_user_end_schedules_trailing_white_noise_non_blocking(self):
+        """User-end schedules ~2s of trailing noise without blocking."""
+        from eva.user_simulator.audio_interface import (
+            USER_TRAILING_SILENCE_CHUNKS,
+        )
+
+        iface = _make_interface()
+        iface._user_audio_active = True
+
+        # Should NOT stream inline; it only sets the pending counter.
+        mock_catchup = AsyncMock()
+        with patch.object(iface, "_send_catchup_silence", new=mock_catchup):
+            await iface._on_user_audio_end(150.0)
+
+        mock_catchup.assert_not_awaited()
+        # 100 chunks x 20ms = 2000ms = 2s of trailing white noise scheduled.
+        assert USER_TRAILING_SILENCE_CHUNKS == 100
+        assert iface._pending_trailing_noise_chunks == USER_TRAILING_SILENCE_CHUNKS
+
+    @pytest.mark.asyncio
+    async def test_user_start_cancels_pending_trailing_noise(self):
+        """A new user turn cancels leftover trailing noise from the prior turn."""
+        iface = _make_interface()
+        iface._pending_trailing_noise_chunks = 42
+
+        await iface._on_user_audio_start()
+
+        assert iface._pending_trailing_noise_chunks == 0
+
+    @pytest.mark.asyncio
+    async def test_trailing_noise_frame_decrements_and_records(self):
+        """Each trailing-noise frame sends noise, decrements, and records it."""
+        from eva.user_simulator.audio_interface import _white_noise_pcm
+
+        record_callback = MagicMock()
+        iface = _make_interface(record_callback=record_callback)
+        iface._pending_trailing_noise_chunks = 3
+
+        with patch.object(iface, "_send_white_noise_frame", new=AsyncMock(return_value=True)):
+            sent = await iface._send_trailing_noise_frame()
+
+        assert sent is True
+        assert iface._pending_trailing_noise_chunks == 2
+        recorded = [(c.args[0], c.args[1]) for c in record_callback.call_args_list]
+        assert ("user", _white_noise_pcm(SEND_CHUNK_SIZE_PCM)) in recorded
+        assert ("user_clean", _white_noise_pcm(SEND_CHUNK_SIZE_PCM)) in recorded
+
+    @pytest.mark.asyncio
+    async def test_trailing_noise_frame_no_decrement_on_send_failure(self):
+        """A failed send must not decrement the pending counter or record."""
+        record_callback = MagicMock()
+        iface = _make_interface(record_callback=record_callback)
+        iface._pending_trailing_noise_chunks = 3
+
+        with patch.object(iface, "_send_white_noise_frame", new=AsyncMock(return_value=False)):
+            sent = await iface._send_trailing_noise_frame()
+
+        assert sent is False
+        assert iface._pending_trailing_noise_chunks == 3
+        record_callback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_loop_ends_turn_when_audio_ends_on_chunk_boundary(self):
+        """End-of-turn must fire even with no leftover partial chunk.
+
+        Regression: a user utterance that ends exactly on a full 640-byte chunk
+        boundary leaves pending_audio empty, so the partial-chunk end-detection
+        never triggers. The queue-inactivity fallback must still end the turn.
+        """
+        from eva.user_simulator.audio_interface import SEND_CHUNK_SIZE_PCM
+
+        iface = _make_interface()
+        iface.running = True
+        iface.websocket = MagicMock()  # truthy; _send_audio_frame is mocked below
+
+        end_called = asyncio.Event()
+
+        async def on_end(_current_time):
+            iface._user_audio_active = False
+            iface.running = False  # stop the loop once the turn ends
+            end_called.set()
+
+        # One full-aligned chunk of user audio, then the queue goes quiet.
+        iface.send_queue.put_nowait(b"\x01\x02" * (SEND_CHUNK_SIZE_PCM // 2))
+
+        with (
+            patch.object(iface, "_send_audio_frame", new=AsyncMock(return_value=True)),
+            patch.object(iface, "_on_user_audio_start", new=AsyncMock()),
+            patch.object(iface, "_on_user_audio_end", new=AsyncMock(side_effect=on_end)),
+            # Speed up the 600ms detection window for the test.
+            patch("eva.user_simulator.audio_interface.USER_END_DETECTION_DELAY_INTERVALS", 2),
+        ):
+            # Simulate that the first chunk marked the user active.
+            iface._user_audio_active = True
+            await asyncio.wait_for(iface._send_to_assistant(), timeout=5.0)
+            iface._on_user_audio_end.assert_awaited()
+
+        assert end_called.is_set()
+
+    @pytest.mark.asyncio
+    async def test_catchup_silence_records_user_track(self):
+        """User trailing silence must be recorded so saved audio matches."""
+        record_callback = MagicMock()
+        iface = _make_interface(record_callback=record_callback)
+
+        with patch.object(iface, "_send_silence_frame", new=AsyncMock(return_value=True)):
+            await iface._send_catchup_silence("user", 3)
+
+        # Each successful frame records into both "user" and "user_clean" tracks.
+        recorded_tracks = [call.args[0] for call in record_callback.call_args_list]
+        assert recorded_tracks.count("user") == 3
+        assert recorded_tracks.count("user_clean") == 3
+
+    @pytest.mark.asyncio
+    async def test_catchup_white_noise_sends_and_records_noise(self):
+        """White-noise trailing block sends noise frames and records them."""
+        from eva.user_simulator.audio_interface import _white_noise_pcm
+
+        record_callback = MagicMock()
+        iface = _make_interface(record_callback=record_callback)
+
+        mock_noise_frame = AsyncMock(return_value=True)
+        with (
+            patch.object(iface, "_send_white_noise_frame", new=mock_noise_frame),
+            patch.object(iface, "_send_silence_frame", new=AsyncMock(return_value=True)) as mock_silence,
+        ):
+            await iface._send_catchup_silence("user", 3, use_white_noise=True)
+
+        # White-noise path is used, not the silence path.
+        assert mock_noise_frame.await_count == 3
+        mock_silence.assert_not_awaited()
+
+        # Recorded audio is the (cached) white-noise buffer, not zeros.
+        recorded_payloads = {call.args[1] for call in record_callback.call_args_list}
+        assert recorded_payloads == {_white_noise_pcm()}
+        assert _white_noise_pcm() != b"\x00" * len(_white_noise_pcm())
+
+    @pytest.mark.asyncio
+    async def test_catchup_silence_does_not_record_assistant_track(self):
+        """Assistant-sourced catch-up silence should not record user audio."""
+        record_callback = MagicMock()
+        iface = _make_interface(record_callback=record_callback)
+
+        with patch.object(iface, "_send_silence_frame", new=AsyncMock(return_value=True)):
+            await iface._send_catchup_silence("assistant", 3)
+
+        recorded_tracks = [call.args[0] for call in record_callback.call_args_list]
+        assert "user" not in recorded_tracks
 
     @pytest.mark.asyncio
     async def test_assistant_end_records_timestamp(self):

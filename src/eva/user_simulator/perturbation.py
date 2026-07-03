@@ -48,7 +48,8 @@ _BAD_CONNECTION_SEGMENT_BYTES = 640  # 20 ms at 16 kHz 16-bit PCM
 _BAD_CONNECTION_GAIN_LOW = 0.5
 _BAD_CONNECTION_GAIN_HIGH = 1.2
 
-_REFERENCE_SPEECH_RMS: float = 3000.0  # typical 16-bit conversational speech (~-21 dBFS)
+REFERENCE_SPEECH_RMS: float = 3000.0  # typical 16-bit conversational speech (~-21 dBFS)
+_REFERENCE_SPEECH_RMS: float = REFERENCE_SPEECH_RMS  # backward-compat alias
 
 
 def _load_noise_wav(noise_type: str) -> np.ndarray:
