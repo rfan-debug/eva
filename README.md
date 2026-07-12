@@ -98,6 +98,7 @@ EVA_DOMAIN=airline           # Domain-based path conventions
 EVA_MAX_CONCURRENT_CONVERSATIONS=5   # Max parallel conversations
 EVA_DEBUG=false                       # Run only 1 record for testing when enabled
 EVA_RECORD_IDS=1.2.1,1.2.2            # Run specific records only (remove to run all records)
+EVA_EXCLUDE_RECORD_IDS=6.1.1          # Skip specific records (applied after EVA_RECORD_IDS)
 
 # Pipeline Model Configuration (nested under EVA_MODEL__)
 EVA_MODEL__LLM=gpt-5-mini                # LLM model name (must match EVA_MODEL_LIST)
